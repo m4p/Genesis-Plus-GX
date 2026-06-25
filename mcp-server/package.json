@@ -1,0 +1,16 @@
+{
+  "name": "genesis-plus-gx-memory-mcp",
+  "version": "1.0.0",
+  "description": "MCP server exposing the Genesis Plus GX SDL2 peek/poke JSON API as MCP tools",
+  "type": "module",
+  "main": "index.js",
+  "bin": {
+    "genesis-plus-gx-memory-mcp": "./index.js"
+  },
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.4"
+  }
+}
