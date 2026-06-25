@@ -61,6 +61,8 @@ typedef enum
   API_REQ_STATE_SAVE,
   API_REQ_STATE_LOAD,
   API_REQ_REGISTERS,
+  API_REQ_SNAPSHOT,
+  API_REQ_DIFF,
   API_REQ_PAUSE,
   API_REQ_RESUME,
   API_REQ_FRAME,
@@ -89,9 +91,33 @@ typedef struct
   uint32 reg_set_values[20];       /* registers only */
   int reg_set_count;               /* registers only */
   char reg_json[768];              /* registers only: full register-state response body, filled by process_pending */
+  char snap_slot[32];                                    /* snapshot/diff only: slot name */
+  char snap_filter[16];                                   /* diff only: "changed"/"unchanged"/"increased"/"decreased" */
+  uint32 snap_value_size;                                 /* diff only: 1, 2 or 4 */
+  uint32 diff_offsets[MEMORY_API_MAX_SEARCH_RESULTS];      /* diff only */
+  uint32 diff_old_values[MEMORY_API_MAX_SEARCH_RESULTS];   /* diff only */
+  uint32 diff_new_values[MEMORY_API_MAX_SEARCH_RESULTS];   /* diff only */
+  uint32 diff_count;                                       /* diff only */
   int result; /* MEMORY_API_OK / MEMORY_API_ERR_* on completion for memory
                  requests; 0 on success / -1 on failure for everything else */
 } api_mailbox_t;
+
+/* Custom result codes used only by API_REQ_SNAPSHOT/API_REQ_DIFF, chosen to
+   never collide with the negative MEMORY_API_ERR_* range. */
+#define API_ERR_SNAPSHOT_SLOTS_FULL  (-100)
+#define API_ERR_SNAPSHOT_NOT_FOUND   (-101)
+
+#define API_MAX_SNAPSHOT_SLOTS 4
+
+typedef struct
+{
+  int in_use;
+  char name[32];
+  memory_domain_id_t domain;
+  uint32 start;
+  uint32 length;
+  uint8 data[MEMORY_API_MAX_TRANSFER];
+} api_snapshot_t;
 
 static api_mailbox_t mailbox;
 static int request_pending  = 0; /* server thread -> main thread */
@@ -108,6 +134,11 @@ static volatile int api_paused     = 0;
    thread (sdl2/main.c's sdl_input_update(), called once per frame from the
    same loop that calls api_server_process_pending()) -- no locking needed. */
 static uint16 api_held_buttons = 0;
+
+/* Named snapshot slots for POST /snapshot and POST /diff. Only ever touched
+   from the main/emulation thread, one request at a time (see threading note
+   above api_held_buttons). */
+static api_snapshot_t snapshots[API_MAX_SNAPSHOT_SLOTS];
 
 static api_screenshot_fn screenshot_handler = NULL;
 
@@ -311,6 +342,150 @@ int api_server_process_pending(void)
       }
 
       mailbox.result = 0;
+      break;
+    }
+
+    case API_REQ_SNAPSHOT:
+    {
+      api_snapshot_t *slot = NULL;
+      int i;
+
+      for (i = 0; i < API_MAX_SNAPSHOT_SLOTS; i++)
+      {
+        if (snapshots[i].in_use && !strcmp(snapshots[i].name, mailbox.snap_slot))
+        {
+          slot = &snapshots[i];
+          break;
+        }
+      }
+      if (!slot)
+      {
+        for (i = 0; i < API_MAX_SNAPSHOT_SLOTS; i++)
+        {
+          if (!snapshots[i].in_use)
+          {
+            slot = &snapshots[i];
+            break;
+          }
+        }
+      }
+      if (!slot)
+      {
+        mailbox.result = API_ERR_SNAPSHOT_SLOTS_FULL;
+        break;
+      }
+
+      {
+        const memory_domain_info_t *domains;
+        int count;
+        uint32 dom_size = 0;
+        uint32 start = mailbox.address;
+        uint32 end = mailbox.search_end;
+
+        memory_api_list_domains(&domains, &count);
+        if ((mailbox.domain >= 0) && (mailbox.domain < count))
+        {
+          dom_size = domains[mailbox.domain].size;
+        }
+
+        if ((end == 0) || (end > dom_size))
+        {
+          end = dom_size;
+        }
+        if ((start > end) || ((end - start) > MEMORY_API_MAX_TRANSFER))
+        {
+          mailbox.result = MEMORY_API_ERR_INVALID_RANGE;
+          break;
+        }
+
+        mailbox.result = memory_api_read(mailbox.domain, start, slot->data, end - start);
+        if (mailbox.result == MEMORY_API_OK)
+        {
+          strncpy(slot->name, mailbox.snap_slot, sizeof(slot->name) - 1);
+          slot->name[sizeof(slot->name) - 1] = '\0';
+          slot->domain = mailbox.domain;
+          slot->start = start;
+          slot->length = end - start;
+          slot->in_use = 1;
+          mailbox.address = start;
+          mailbox.length = slot->length;
+        }
+      }
+      break;
+    }
+
+    case API_REQ_DIFF:
+    {
+      api_snapshot_t *slot = NULL;
+      int i;
+      static uint8 diff_live[MEMORY_API_MAX_TRANSFER];
+
+      for (i = 0; i < API_MAX_SNAPSHOT_SLOTS; i++)
+      {
+        if (snapshots[i].in_use && !strcmp(snapshots[i].name, mailbox.snap_slot))
+        {
+          slot = &snapshots[i];
+          break;
+        }
+      }
+      if (!slot)
+      {
+        mailbox.result = API_ERR_SNAPSHOT_NOT_FOUND;
+        break;
+      }
+
+      mailbox.domain = slot->domain;
+      mailbox.address = slot->start;
+      mailbox.length = slot->length;
+
+      mailbox.result = memory_api_read(slot->domain, slot->start, diff_live, slot->length);
+      if (mailbox.result != MEMORY_API_OK)
+      {
+        break;
+      }
+
+      {
+        uint32 vs = mailbox.snap_value_size ? mailbox.snap_value_size : 1;
+        uint32 max_results = mailbox.search_max_results ? mailbox.search_max_results : 64;
+        uint32 count = 0;
+        uint32 off;
+
+        if (max_results > MEMORY_API_MAX_SEARCH_RESULTS)
+        {
+          max_results = MEMORY_API_MAX_SEARCH_RESULTS;
+        }
+
+        for (off = 0; ((off + vs) <= slot->length) && (count < max_results); off += vs)
+        {
+          uint32 oldv = 0, newv = 0;
+          uint32 k;
+          int keep;
+
+          for (k = 0; k < vs; k++)
+          {
+            oldv = (oldv << 8) | slot->data[off + k];
+            newv = (newv << 8) | diff_live[off + k];
+          }
+
+          if (!strcmp(mailbox.snap_filter, "changed")) keep = (oldv != newv);
+          else if (!strcmp(mailbox.snap_filter, "unchanged")) keep = (oldv == newv);
+          else if (!strcmp(mailbox.snap_filter, "increased")) keep = (newv > oldv);
+          else if (!strcmp(mailbox.snap_filter, "decreased")) keep = (newv < oldv);
+          else keep = 0;
+
+          if (keep)
+          {
+            mailbox.diff_offsets[count] = slot->start + off;
+            mailbox.diff_old_values[count] = oldv;
+            mailbox.diff_new_values[count] = newv;
+            count++;
+          }
+        }
+
+        mailbox.diff_count = count;
+      }
+
+      mailbox.result = MEMORY_API_OK;
       break;
     }
 
@@ -1025,6 +1200,158 @@ static void handle_search(int fd, const char *json)
   free(out_text);
 }
 
+static void handle_snapshot(int fd, const char *json)
+{
+  char slot[32];
+  char domain_name[64];
+  memory_domain_id_t domain_id;
+  uint32 start = 0, end = 0;
+  api_mailbox_t req;
+  char body[256];
+
+  if (!json_get_string(json, "slot", slot, sizeof(slot)))
+  {
+    strncpy(slot, "default", sizeof(slot) - 1);
+    slot[sizeof(slot) - 1] = '\0';
+  }
+  if (!json_get_string(json, "domain", domain_name, sizeof(domain_name)))
+  {
+    send_error(fd, 400, "bad_json", "Missing or invalid 'domain' field");
+    return;
+  }
+  if (memory_api_find_domain(domain_name, &domain_id) != MEMORY_API_OK)
+  {
+    send_error(fd, 400, "unknown_domain", "Unknown memory domain");
+    return;
+  }
+
+  /* 'start' and 'end' are optional; end defaults to the domain's size */
+  json_get_uint(json, "start", &start);
+  json_get_uint(json, "end", &end);
+
+  memset(&req, 0, sizeof(req));
+  req.type = API_REQ_SNAPSHOT;
+  req.domain = domain_id;
+  req.address = start;
+  req.search_end = end;
+  strncpy(req.snap_slot, slot, sizeof(req.snap_slot) - 1);
+
+  submit_request(&req);
+
+  if (req.result == API_ERR_SNAPSHOT_SLOTS_FULL)
+  {
+    send_error(fd, 400, "too_many_snapshots",
+               "Maximum number of snapshot slots (4) already in use; diff or reuse an existing slot name");
+    return;
+  }
+  if (req.result != MEMORY_API_OK)
+  {
+    send_memory_api_error(fd, req.result);
+    return;
+  }
+
+  snprintf(body, sizeof(body),
+           "{\"ok\":true,\"slot\":\"%s\",\"domain\":\"%s\",\"start\":%u,\"length\":%u}",
+           slot, domain_name, req.address, req.length);
+  send_ok(fd, body);
+}
+
+static void handle_diff(int fd, const char *json)
+{
+  char slot[32];
+  char filter[16];
+  uint32 value_size = 1, max_results = 64;
+  api_mailbox_t req;
+  char *out_text;
+  size_t out_cap, off;
+  uint32 i;
+  const memory_domain_info_t *domains;
+  int count;
+  const char *domain_name = "";
+
+  if (!json_get_string(json, "slot", slot, sizeof(slot)))
+  {
+    strncpy(slot, "default", sizeof(slot) - 1);
+    slot[sizeof(slot) - 1] = '\0';
+  }
+  if (!json_get_string(json, "filter", filter, sizeof(filter)))
+  {
+    strncpy(filter, "changed", sizeof(filter) - 1);
+    filter[sizeof(filter) - 1] = '\0';
+  }
+  if (strcmp(filter, "changed") && strcmp(filter, "unchanged") && strcmp(filter, "increased") && strcmp(filter, "decreased"))
+  {
+    send_error(fd, 400, "invalid_filter", "Supported filters are 'changed', 'unchanged', 'increased', 'decreased'");
+    return;
+  }
+  if (json_get_uint(json, "value_size", &value_size))
+  {
+    if ((value_size != 1) && (value_size != 2) && (value_size != 4))
+    {
+      send_error(fd, 400, "invalid_value_size", "'value_size' must be 1, 2 or 4");
+      return;
+    }
+  }
+  if (json_get_uint(json, "max_results", &max_results))
+  {
+    if (max_results == 0)
+    {
+      max_results = 1;
+    }
+    if (max_results > MEMORY_API_MAX_SEARCH_RESULTS)
+    {
+      max_results = MEMORY_API_MAX_SEARCH_RESULTS;
+    }
+  }
+
+  memset(&req, 0, sizeof(req));
+  req.type = API_REQ_DIFF;
+  strncpy(req.snap_slot, slot, sizeof(req.snap_slot) - 1);
+  strncpy(req.snap_filter, filter, sizeof(req.snap_filter) - 1);
+  req.snap_value_size = value_size;
+  req.search_max_results = max_results;
+
+  submit_request(&req);
+
+  if (req.result == API_ERR_SNAPSHOT_NOT_FOUND)
+  {
+    send_error(fd, 404, "snapshot_not_found", "No snapshot exists for this slot; call POST /snapshot first");
+    return;
+  }
+  if (req.result != MEMORY_API_OK)
+  {
+    send_memory_api_error(fd, req.result);
+    return;
+  }
+
+  memory_api_list_domains(&domains, &count);
+  if ((req.domain >= 0) && (req.domain < count))
+  {
+    domain_name = domains[req.domain].name;
+  }
+
+  out_cap = ((size_t)req.diff_count * 40) + 256;
+  out_text = (char *)malloc(out_cap);
+  if (!out_text)
+  {
+    send_error(fd, 500, "internal_error", "Out of memory");
+    return;
+  }
+
+  off = (size_t)snprintf(out_text, out_cap,
+                          "{\"slot\":\"%s\",\"domain\":\"%s\",\"filter\":\"%s\",\"value_size\":%u,\"count\":%u,\"matches\":[",
+                          slot, domain_name, filter, value_size, req.diff_count);
+  for (i = 0; i < req.diff_count; i++)
+  {
+    off += (size_t)snprintf(out_text + off, out_cap - off, "%s{\"offset\":%u,\"old\":%u,\"new\":%u}",
+                             (i > 0) ? "," : "", req.diff_offsets[i], req.diff_old_values[i], req.diff_new_values[i]);
+  }
+  snprintf(out_text + off, out_cap - off, "]}");
+
+  send_ok(fd, out_text);
+  free(out_text);
+}
+
 /* Full Mega Drive / Mega CD 6-button pad layout. */
 typedef struct
 {
@@ -1419,6 +1746,14 @@ static void handle_connection(int fd)
   else if (!strcmp(method, "POST") && !strcmp(path, "/search"))
   {
     handle_search(fd, body);
+  }
+  else if (!strcmp(method, "POST") && !strcmp(path, "/snapshot"))
+  {
+    handle_snapshot(fd, body);
+  }
+  else if (!strcmp(method, "POST") && !strcmp(path, "/diff"))
+  {
+    handle_diff(fd, body);
   }
   else if (!strcmp(method, "POST") && !strcmp(path, "/input"))
   {

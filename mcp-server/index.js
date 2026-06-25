@@ -112,6 +112,39 @@ server.registerTool(
     toolResult(await apiPost("/search", { domain, pattern, encoding, start, end, max_results }))
 );
 
+server.registerTool(
+  "snapshot",
+  {
+    title: "Take a memory snapshot",
+    description:
+      "Capture the current bytes of a memory domain (or a sub-range of it) into a named slot, for later comparison with diff_snapshot. Up to 4 slots; calling again with the same slot name overwrites it. Mirrors a classic Cheat Engine 'first scan'.",
+    inputSchema: {
+      domain: z.string().describe("Domain name, e.g. main_68k_ram, z80_ram, vram, cram, vsram, scd_prg_ram, scd_word_ram, scd_bram"),
+      slot: z.string().optional().describe("Snapshot slot name (default 'default')"),
+      start: z.number().int().nonnegative().optional().describe("Start offset of the captured range (default 0)"),
+      end: z.number().int().nonnegative().optional().describe("End offset of the captured range, exclusive (default: domain size, capped at 64KB)"),
+    },
+  },
+  async ({ domain, slot, start, end }) => toolResult(await apiPost("/snapshot", { domain, slot, start, end }))
+);
+
+server.registerTool(
+  "diff_snapshot",
+  {
+    title: "Diff memory against a snapshot",
+    description:
+      "Compare the live bytes of a previously captured snapshot slot against current memory and report matching offsets, like Cheat Engine's 'next scan'. Filters: 'changed', 'unchanged', 'increased', 'decreased'. value_size controls comparison granularity (1, 2, or 4 bytes, big-endian).",
+    inputSchema: {
+      slot: z.string().optional().describe("Snapshot slot name (default 'default')"),
+      filter: z.enum(["changed", "unchanged", "increased", "decreased"]).optional().describe("Default 'changed'"),
+      value_size: z.union([z.literal(1), z.literal(2), z.literal(4)]).optional().describe("Bytes per compared value (default 1)"),
+      max_results: z.number().int().positive().max(256).optional().describe("Maximum number of matches to return (default 64, capped at 256)"),
+    },
+  },
+  async ({ slot, filter, value_size, max_results }) =>
+    toolResult(await apiPost("/diff", { slot, filter, value_size, max_results }))
+);
+
 const BUTTON_NAMES = ["up", "down", "left", "right", "a", "b", "c", "x", "y", "z", "start", "mode"];
 
 server.registerTool(
