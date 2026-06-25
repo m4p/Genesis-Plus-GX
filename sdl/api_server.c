@@ -54,6 +54,7 @@ typedef enum
   API_REQ_NONE = 0,
   API_REQ_PEEK,
   API_REQ_POKE,
+  API_REQ_SEARCH,
   API_REQ_PAUSE,
   API_REQ_RESUME,
   API_REQ_FRAME,
@@ -64,9 +65,13 @@ typedef struct
 {
   api_request_type_t type;
   memory_domain_id_t domain;
-  uint32 address;
-  uint32 length;
-  uint8 buffer[MEMORY_API_MAX_TRANSFER]; /* poke input in, peek output out */
+  uint32 address;     /* also used as search range 'start' */
+  uint32 length;      /* also used as search 'pattern_length' */
+  uint32 search_end;        /* search only: range 'end' (0 = domain size) */
+  uint32 search_max_results; /* search only */
+  uint8 buffer[MEMORY_API_MAX_TRANSFER]; /* poke input, peek output, or search pattern */
+  uint32 search_offsets[MEMORY_API_MAX_SEARCH_RESULTS]; /* search only */
+  uint32 search_count;       /* search only */
   int result; /* MEMORY_API_OK / MEMORY_API_ERR_* on completion */
 } api_mailbox_t;
 
@@ -135,6 +140,13 @@ int api_server_process_pending(void)
 
     case API_REQ_POKE:
       mailbox.result = memory_api_write(mailbox.domain, mailbox.address, mailbox.buffer, mailbox.length);
+      break;
+
+    case API_REQ_SEARCH:
+      mailbox.result = memory_api_search(mailbox.domain, mailbox.address, mailbox.search_end,
+                                          mailbox.buffer, mailbox.length,
+                                          mailbox.search_offsets, mailbox.search_max_results,
+                                          &mailbox.search_count);
       break;
 
     case API_REQ_PAUSE:
@@ -476,6 +488,9 @@ static void send_memory_api_error(int fd, int err)
     case MEMORY_API_ERR_NOT_WRITABLE:
       send_error(fd, 400, "domain_not_writable", "Memory domain is not writable");
       break;
+    case MEMORY_API_ERR_INVALID_PATTERN:
+      send_error(fd, 400, "invalid_pattern", "Pattern must be non-empty and within the per-request limit");
+      break;
     default:
       send_error(fd, 500, "internal_error", "Internal error");
       break;
@@ -679,6 +694,117 @@ static void handle_poke(int fd, const char *json)
   send_ok(fd, body);
 }
 
+static void handle_search(int fd, const char *json)
+{
+  char domain_name[64];
+  char encoding[16];
+  char pattern_field[2 * MEMORY_API_MAX_SEARCH_PATTERN + 4];
+  uint32 start = 0, end = 0, max_results = 64;
+  memory_domain_id_t domain_id;
+  api_mailbox_t req;
+  int decoded_len;
+  char *out_text;
+  size_t out_cap;
+  size_t off;
+  uint32 i;
+
+  if (!json_get_string(json, "domain", domain_name, sizeof(domain_name)))
+  {
+    send_error(fd, 400, "bad_json", "Missing or invalid 'domain' field");
+    return;
+  }
+  if (!json_get_string(json, "encoding", encoding, sizeof(encoding)))
+  {
+    send_error(fd, 400, "invalid_encoding", "Missing or invalid 'encoding' field");
+    return;
+  }
+  if (strcmp(encoding, "hex") && strcmp(encoding, "base64"))
+  {
+    send_error(fd, 400, "invalid_encoding", "Supported encodings are 'hex' and 'base64'");
+    return;
+  }
+  if (!json_get_string(json, "pattern", pattern_field, sizeof(pattern_field)))
+  {
+    send_error(fd, 400, "bad_json", "Missing or invalid 'pattern' field");
+    return;
+  }
+  if (memory_api_find_domain(domain_name, &domain_id) != MEMORY_API_OK)
+  {
+    send_error(fd, 400, "unknown_domain", "Unknown memory domain");
+    return;
+  }
+
+  /* 'start', 'end' and 'max_results' are all optional */
+  json_get_uint(json, "start", &start);
+  json_get_uint(json, "end", &end);
+  if (json_get_uint(json, "max_results", &max_results))
+  {
+    if (max_results == 0)
+    {
+      max_results = 1;
+    }
+    if (max_results > MEMORY_API_MAX_SEARCH_RESULTS)
+    {
+      max_results = MEMORY_API_MAX_SEARCH_RESULTS;
+    }
+  }
+
+  memset(&req, 0, sizeof(req));
+
+  if (!strcmp(encoding, "hex"))
+  {
+    decoded_len = hex_decode(req.buffer, sizeof(req.buffer), pattern_field);
+  }
+  else
+  {
+    decoded_len = base64_decode(req.buffer, sizeof(req.buffer), pattern_field);
+  }
+
+  if (decoded_len < 0)
+  {
+    send_error(fd, 400, "decode_failed", "Could not decode 'pattern' using the given encoding");
+    return;
+  }
+  if ((decoded_len == 0) || (decoded_len > MEMORY_API_MAX_SEARCH_PATTERN))
+  {
+    send_error(fd, 400, "invalid_pattern", "Pattern must be non-empty and within the per-request limit");
+    return;
+  }
+
+  req.type = API_REQ_SEARCH;
+  req.domain = domain_id;
+  req.address = start;
+  req.search_end = end;
+  req.length = (uint32)decoded_len;
+  req.search_max_results = max_results;
+
+  if (submit_request(&req) != MEMORY_API_OK)
+  {
+    send_memory_api_error(fd, req.result);
+    return;
+  }
+
+  out_cap = ((size_t)req.search_count * 12) + 256;
+  out_text = (char *)malloc(out_cap);
+  if (!out_text)
+  {
+    send_error(fd, 500, "internal_error", "Out of memory");
+    return;
+  }
+
+  off = (size_t)snprintf(out_text, out_cap,
+                          "{\"domain\":\"%s\",\"pattern_length\":%d,\"count\":%u,\"offsets\":[",
+                          domain_name, decoded_len, req.search_count);
+  for (i = 0; i < req.search_count; i++)
+  {
+    off += (size_t)snprintf(out_text + off, out_cap - off, "%s%u", (i > 0) ? "," : "", req.search_offsets[i]);
+  }
+  snprintf(out_text + off, out_cap - off, "]}");
+
+  send_ok(fd, out_text);
+  free(out_text);
+}
+
 static void handle_simple_control(int fd, api_request_type_t type)
 {
   api_mailbox_t req;
@@ -818,6 +944,10 @@ static void handle_connection(int fd)
   else if (!strcmp(method, "POST") && !strcmp(path, "/peek"))
   {
     handle_peek(fd, body);
+  }
+  else if (!strcmp(method, "POST") && !strcmp(path, "/search"))
+  {
+    handle_search(fd, body);
   }
   else if (!strcmp(method, "POST") && !strcmp(path, "/poke"))
   {

@@ -231,6 +231,88 @@ int memory_api_read(memory_domain_id_t domain, uint32 address, uint8 *out, uint3
   return MEMORY_API_OK;
 }
 
+/* Scratch buffer used to present Sega CD Word-RAM as a linear 256K view for
+   searching (see scd_word_ram_copy() above). Only ever touched from the
+   main/emulation thread, one request at a time. */
+static uint8 word_ram_search_scratch[SCD_WORD_RAM_SIZE];
+
+int memory_api_search(memory_domain_id_t domain, uint32 start, uint32 end,
+                       const uint8 *pattern, uint32 pattern_length,
+                       uint32 *out_offsets, uint32 max_results, uint32 *out_count)
+{
+  uint8 *base = NULL;
+  uint32 size = 0;
+  int readable = 0, writable = 0;
+  const uint8 *haystack;
+  uint32 count = 0;
+  uint32 i;
+  int err;
+
+  if (!pattern || !out_offsets || !out_count)
+  {
+    return MEMORY_API_ERR_INVALID_RANGE;
+  }
+
+  if ((pattern_length == 0) || (pattern_length > MEMORY_API_MAX_SEARCH_PATTERN))
+  {
+    return MEMORY_API_ERR_INVALID_PATTERN;
+  }
+
+  err = resolve_domain(domain, &base, &size, &readable, &writable);
+  if (err != MEMORY_API_OK)
+  {
+    return err;
+  }
+
+  if (!readable)
+  {
+    return MEMORY_API_ERR_NOT_READABLE;
+  }
+
+  if ((end == 0) || (end > size))
+  {
+    end = size;
+  }
+
+  if (start > end)
+  {
+    return MEMORY_API_ERR_INVALID_RANGE;
+  }
+
+  if (max_results > MEMORY_API_MAX_SEARCH_RESULTS)
+  {
+    max_results = MEMORY_API_MAX_SEARCH_RESULTS;
+  }
+
+  *out_count = 0;
+
+  if (pattern_length > (end - start))
+  {
+    return MEMORY_API_OK;
+  }
+
+  if (domain == MEM_DOMAIN_SCD_WORD_RAM)
+  {
+    scd_word_ram_copy(0, size, word_ram_search_scratch, NULL, 0);
+    haystack = word_ram_search_scratch;
+  }
+  else
+  {
+    haystack = base;
+  }
+
+  for (i = start; (i + pattern_length <= end) && (count < max_results); i++)
+  {
+    if (!memcmp(haystack + i, pattern, pattern_length))
+    {
+      out_offsets[count++] = i;
+    }
+  }
+
+  *out_count = count;
+  return MEMORY_API_OK;
+}
+
 int memory_api_write(memory_domain_id_t domain, uint32 address, const uint8 *data, uint32 length)
 {
   uint8 *base = NULL;

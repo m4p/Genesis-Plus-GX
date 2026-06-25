@@ -15,6 +15,11 @@
 /* maximum number of bytes that can be transferred in a single read/write request */
 #define MEMORY_API_MAX_TRANSFER 0x10000
 
+/* maximum number of bytes in a search pattern, and maximum number of offsets
+   returned by a single memory_api_search() call */
+#define MEMORY_API_MAX_SEARCH_PATTERN 256
+#define MEMORY_API_MAX_SEARCH_RESULTS 256
+
 typedef enum
 {
   MEM_DOMAIN_MAIN_68K_RAM = 0,
@@ -45,7 +50,8 @@ enum
   MEMORY_API_ERR_INVALID_RANGE      = -3, /* address + length exceeds domain size */
   MEMORY_API_ERR_INVALID_LENGTH     = -4, /* length is zero or exceeds MEMORY_API_MAX_TRANSFER */
   MEMORY_API_ERR_NOT_READABLE       = -5,
-  MEMORY_API_ERR_NOT_WRITABLE       = -6
+  MEMORY_API_ERR_NOT_WRITABLE       = -6,
+  MEMORY_API_ERR_INVALID_PATTERN    = -7 /* pattern is empty or exceeds MEMORY_API_MAX_SEARCH_PATTERN */
 };
 
 /* Returns the static table of all known memory domains and its length.
@@ -65,5 +71,18 @@ int memory_api_read(memory_domain_id_t domain, uint32 address, uint8 *out, uint3
 /* Writes 'length' bytes from 'data' into 'domain' starting at 'address'.
    Returns MEMORY_API_OK on success, or a negative MEMORY_API_ERR_* code. */
 int memory_api_write(memory_domain_id_t domain, uint32 address, const uint8 *data, uint32 length);
+
+/* Searches for every occurrence of 'pattern' (pattern_length bytes) within
+   ['start', 'end') of 'domain'. If 'end' is 0 it defaults to the domain's
+   size. Writes up to 'max_results' matching offsets into 'out_offsets'
+   (caller-allocated, at least 'max_results' entries, capped internally to
+   MEMORY_API_MAX_SEARCH_RESULTS) and the number of matches written into
+   *out_count. A pattern longer than the search range or zero/oversized
+   pattern_length is reported via *out_count = 0 / MEMORY_API_ERR_INVALID_PATTERN
+   respectively, not a partial result.
+   Returns MEMORY_API_OK on success, or a negative MEMORY_API_ERR_* code. */
+int memory_api_search(memory_domain_id_t domain, uint32 start, uint32 end,
+                       const uint8 *pattern, uint32 pattern_length,
+                       uint32 *out_offsets, uint32 max_results, uint32 *out_count);
 
 #endif /* _MEMORY_API_H_ */

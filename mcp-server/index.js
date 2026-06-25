@@ -94,6 +94,25 @@ server.registerTool(
 );
 
 server.registerTool(
+  "search",
+  {
+    title: "Search emulated memory",
+    description:
+      "Search a memory domain for every occurrence of a byte pattern, returning matching offsets. Optionally restrict to a [start, end) byte range; end defaults to the domain's size.",
+    inputSchema: {
+      domain: z.string().describe("Domain name, e.g. main_68k_ram, z80_ram, vram, cram, vsram, scd_prg_ram, scd_word_ram, scd_bram"),
+      pattern: z.string().describe("Byte pattern to search for, encoded per 'encoding'"),
+      encoding: z.enum(["hex", "base64"]).default("hex"),
+      start: z.number().int().nonnegative().optional().describe("Start offset of the search range (default 0)"),
+      end: z.number().int().nonnegative().optional().describe("End offset of the search range, exclusive (default: domain size)"),
+      max_results: z.number().int().positive().max(256).optional().describe("Maximum number of offsets to return (default 64, capped at 256)"),
+    },
+  },
+  async ({ domain, pattern, encoding, start, end, max_results }) =>
+    toolResult(await apiPost("/search", { domain, pattern, encoding, start, end, max_results }))
+);
+
+server.registerTool(
   "pause",
   {
     title: "Pause emulation",
