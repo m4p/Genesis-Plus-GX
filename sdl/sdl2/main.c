@@ -738,11 +738,16 @@ int main (int argc, char **argv)
   int running = 1;
   int i;
   char *rom_path = NULL;
+  char *load_state_path = NULL;
 
   /* parse command line flags */
   for (i = 1; i < argc; i++)
   {
-    if (!strcmp(argv[i], "--api-port") && (i + 1 < argc))
+    if (!strcmp(argv[i], "--load-state") && (i + 1 < argc))
+    {
+      load_state_path = argv[++i];
+    }
+    else if (!strcmp(argv[i], "--api-port") && (i + 1 < argc))
     {
       api_enabled = 1;
       api_port = atoi(argv[++i]);
@@ -781,7 +786,8 @@ int main (int argc, char **argv)
   if(!rom_path)
   {
     char caption[512];
-    sprintf(caption, "Genesis Plus GX\\SDL\nusage: %s [--api-port <port>] [--api-bind <address>] gamename\n\n"
+    sprintf(caption, "Genesis Plus GX\\SDL\nusage: %s [--load-state <file>] [--api-port <port>] [--api-bind <address>] gamename\n\n"
+                      "  --load-state <file>      Load a savestate after startup\n"
                       "  --api-port <port>        Enable local JSON peek/poke API on 127.0.0.1\n"
                       "  --api-bind <address>     Bind API server to address, default 127.0.0.1\n",
                       argv[0]);
@@ -933,6 +939,26 @@ int main (int argc, char **argv)
 
   /* reset system hardware */
   system_reset();
+
+  /* load savestate, if requested */
+  if (load_state_path)
+  {
+    fp = fopen(load_state_path, "rb");
+    if (fp != NULL)
+    {
+      uint8 buf[STATE_SIZE];
+      size_t n = fread(buf, 1, STATE_SIZE, fp);
+      fclose(fp);
+      if (n == 0 || !state_load(buf))
+      {
+        fprintf(stderr, "Warning: failed to load savestate `%s'\n", load_state_path);
+      }
+    }
+    else
+    {
+      fprintf(stderr, "Warning: could not open savestate `%s'\n", load_state_path);
+    }
+  }
 
   /* start local JSON peek/poke API, if requested */
   if (api_enabled)
