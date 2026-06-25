@@ -262,6 +262,21 @@ static void sdl_video_close()
   SDL_DestroyWindow(sdl_video.window);
 }
 
+/* Saves the currently displayed frame (i.e. exactly what's on screen, same
+   surface SDL_UpdateWindowSurface() presents) as a BMP file. Used by the
+   JSON API's POST /screenshot. */
+static int main_take_screenshot(const char *path, int *out_width, int *out_height)
+{
+  if (SDL_SaveBMP(sdl_video.surf_screen, path) != 0)
+  {
+    return -1;
+  }
+
+  *out_width = sdl_video.surf_screen->w;
+  *out_height = sdl_video.surf_screen->h;
+  return 0;
+}
+
 /* Frame Sync
  *
  * Pacing is done with SDL_GetPerformanceCounter() directly in the main
@@ -922,6 +937,8 @@ int main (int argc, char **argv)
   /* start local JSON peek/poke API, if requested */
   if (api_enabled)
   {
+    api_server_set_screenshot_handler(main_take_screenshot);
+
     if (api_server_start(api_bind, api_port) != 0)
     {
       fprintf(stderr, "Warning: failed to start JSON API server on %s:%d\n", api_bind, api_port);

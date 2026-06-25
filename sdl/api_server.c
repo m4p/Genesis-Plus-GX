@@ -23,6 +23,7 @@
 #include <string.h>
 #include <ctype.h>
 #include <errno.h>
+#include <time.h>
 
 #include <sys/types.h>
 #include <sys/socket.h>
@@ -56,6 +57,9 @@ typedef enum
   API_REQ_POKE,
   API_REQ_SEARCH,
   API_REQ_INPUT,
+  API_REQ_SCREENSHOT,
+  API_REQ_STATE_SAVE,
+  API_REQ_STATE_LOAD,
   API_REQ_PAUSE,
   API_REQ_RESUME,
   API_REQ_FRAME,
@@ -76,7 +80,11 @@ typedef struct
   uint16 input_press_mask;   /* input only: buttons to start holding */
   uint16 input_release_mask; /* input only: buttons to stop holding */
   uint16 input_held_mask;    /* input only: resulting held-button state */
-  int result; /* MEMORY_API_OK / MEMORY_API_ERR_* on completion */
+  char path[512];            /* screenshot / state save / state load */
+  int width, height;         /* screenshot only */
+  uint32 state_bytes;        /* state save only */
+  int result; /* MEMORY_API_OK / MEMORY_API_ERR_* on completion for memory
+                 requests; 0 on success / -1 on failure for everything else */
 } api_mailbox_t;
 
 static api_mailbox_t mailbox;
@@ -94,6 +102,17 @@ static volatile int api_paused     = 0;
    thread (sdl2/main.c's sdl_input_update(), called once per frame from the
    same loop that calls api_server_process_pending()) -- no locking needed. */
 static uint16 api_held_buttons = 0;
+
+static api_screenshot_fn screenshot_handler = NULL;
+
+void api_server_set_screenshot_handler(api_screenshot_fn fn)
+{
+  screenshot_handler = fn;
+}
+
+/* Scratch buffer for savestate I/O. Only ever touched from the main thread,
+   one request at a time (see threading note above api_held_buttons). */
+static uint8 state_scratch[STATE_SIZE];
 static int listen_fd = -1;
 static SDL_Thread *server_thread = NULL;
 
@@ -165,6 +184,46 @@ int api_server_process_pending(void)
       mailbox.input_held_mask = api_held_buttons;
       mailbox.result = MEMORY_API_OK;
       break;
+
+    case API_REQ_SCREENSHOT:
+      if (!screenshot_handler)
+      {
+        mailbox.result = -1;
+      }
+      else
+      {
+        mailbox.result = screenshot_handler(mailbox.path, &mailbox.width, &mailbox.height);
+      }
+      break;
+
+    case API_REQ_STATE_SAVE:
+    {
+      FILE *f = fopen(mailbox.path, "wb");
+      if (!f)
+      {
+        mailbox.result = -1;
+        break;
+      }
+      mailbox.state_bytes = (uint32)state_save(state_scratch);
+      mailbox.result = (fwrite(state_scratch, mailbox.state_bytes, 1, f) == 1) ? 0 : -1;
+      fclose(f);
+      break;
+    }
+
+    case API_REQ_STATE_LOAD:
+    {
+      FILE *f = fopen(mailbox.path, "rb");
+      size_t n;
+      if (!f)
+      {
+        mailbox.result = -1;
+        break;
+      }
+      n = fread(state_scratch, 1, STATE_SIZE, f);
+      fclose(f);
+      mailbox.result = ((n > 0) && state_load(state_scratch)) ? 0 : -1;
+      break;
+    }
 
     case API_REQ_PAUSE:
       api_paused = 1;
@@ -982,6 +1041,95 @@ static void handle_input(int fd, const char *json)
   send_ok(fd, body);
 }
 
+static void handle_screenshot(int fd, const char *json)
+{
+  char folder[400];
+  char filename[64];
+  static int screenshot_counter = 0;
+  api_mailbox_t req;
+  char body[512];
+
+  if (!json_get_string(json, "folder", folder, sizeof(folder)) || (folder[0] == '\0'))
+  {
+    send_error(fd, 400, "bad_json", "Missing or invalid 'folder' field");
+    return;
+  }
+
+  snprintf(filename, sizeof(filename), "screenshot_%ld_%03d.bmp", (long)time(NULL), screenshot_counter++ % 1000);
+
+  memset(&req, 0, sizeof(req));
+  req.type = API_REQ_SCREENSHOT;
+  snprintf(req.path, sizeof(req.path), "%s/%s", folder, filename);
+
+  submit_request(&req);
+
+  if (req.result != 0)
+  {
+    send_error(fd, 500, "screenshot_failed", "Failed to save screenshot (check that the folder exists and is writable)");
+    return;
+  }
+
+  snprintf(body, sizeof(body), "{\"ok\":true,\"path\":\"%s\",\"width\":%d,\"height\":%d}",
+           req.path, req.width, req.height);
+  send_ok(fd, body);
+}
+
+static void handle_state_save(int fd, const char *json)
+{
+  char path[sizeof(((api_mailbox_t *)0)->path)];
+  api_mailbox_t req;
+  char body[600];
+
+  if (!json_get_string(json, "path", path, sizeof(path)) || (path[0] == '\0'))
+  {
+    send_error(fd, 400, "bad_json", "Missing or invalid 'path' field");
+    return;
+  }
+
+  memset(&req, 0, sizeof(req));
+  req.type = API_REQ_STATE_SAVE;
+  strncpy(req.path, path, sizeof(req.path) - 1);
+
+  submit_request(&req);
+
+  if (req.result != 0)
+  {
+    send_error(fd, 500, "state_save_failed", "Failed to write savestate file");
+    return;
+  }
+
+  snprintf(body, sizeof(body), "{\"ok\":true,\"path\":\"%s\",\"bytes\":%u}", req.path, req.state_bytes);
+  send_ok(fd, body);
+}
+
+static void handle_state_load(int fd, const char *json)
+{
+  char path[sizeof(((api_mailbox_t *)0)->path)];
+  api_mailbox_t req;
+  char body[600];
+
+  if (!json_get_string(json, "path", path, sizeof(path)) || (path[0] == '\0'))
+  {
+    send_error(fd, 400, "bad_json", "Missing or invalid 'path' field");
+    return;
+  }
+
+  memset(&req, 0, sizeof(req));
+  req.type = API_REQ_STATE_LOAD;
+  strncpy(req.path, path, sizeof(req.path) - 1);
+
+  submit_request(&req);
+
+  if (req.result != 0)
+  {
+    send_error(fd, 500, "state_load_failed", "Failed to load savestate file (missing, unreadable, or not a valid savestate)");
+    return;
+  }
+
+  snprintf(body, sizeof(body), "{\"ok\":true,\"path\":\"%s\"}", req.path);
+  send_ok(fd, body);
+}
+
 static void handle_simple_control(int fd, api_request_type_t type)
 {
   api_mailbox_t req;
@@ -1129,6 +1277,18 @@ static void handle_connection(int fd)
   else if (!strcmp(method, "POST") && !strcmp(path, "/input"))
   {
     handle_input(fd, body);
+  }
+  else if (!strcmp(method, "POST") && !strcmp(path, "/screenshot"))
+  {
+    handle_screenshot(fd, body);
+  }
+  else if (!strcmp(method, "POST") && !strcmp(path, "/state/save"))
+  {
+    handle_state_save(fd, body);
+  }
+  else if (!strcmp(method, "POST") && !strcmp(path, "/state/load"))
+  {
+    handle_state_load(fd, body);
   }
   else if (!strcmp(method, "POST") && !strcmp(path, "/poke"))
   {

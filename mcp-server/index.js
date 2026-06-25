@@ -159,6 +159,43 @@ server.registerTool(
 );
 
 server.registerTool(
+  "screenshot",
+  {
+    title: "Take a screenshot",
+    description:
+      "Save a BMP screenshot of the currently displayed emulator frame into the given folder (which must already exist). The filename is generated automatically; the returned path points to the saved file.",
+    inputSchema: {
+      folder: z.string().describe("Absolute or relative path to an existing, writable folder"),
+    },
+  },
+  async ({ folder }) => toolResult(await apiPost("/screenshot", { folder }))
+);
+
+server.registerTool(
+  "save_state",
+  {
+    title: "Save state",
+    description: "Save the emulator's full state to the given file path (creates or overwrites it).",
+    inputSchema: {
+      path: z.string().describe("File path to write the savestate to"),
+    },
+  },
+  async ({ path }) => toolResult(await apiPost("/state/save", { path }))
+);
+
+server.registerTool(
+  "load_state",
+  {
+    title: "Load state",
+    description: "Restore the emulator's full state from a previously saved savestate file.",
+    inputSchema: {
+      path: z.string().describe("File path to a savestate previously written by save_state"),
+    },
+  },
+  async ({ path }) => toolResult(await apiPost("/state/load", { path }))
+);
+
+server.registerTool(
   "reset",
   {
     title: "Reset emulator",

@@ -39,4 +39,15 @@ int api_server_is_paused(void);
    frame so injected button presses persist alongside real keyboard input. */
 uint16 api_server_get_input_overlay(void);
 
+/* Implements POST /screenshot: saves a snapshot of the currently displayed
+   frame to 'path' (the SDL2 frontend writes BMP) and reports its pixel
+   width and height via the out parameters. Returns 0 on success, -1 on
+   failure. Called from the main/emulation thread only. */
+typedef int (*api_screenshot_fn)(const char *path, int *out_width, int *out_height);
+
+/* Registers the callback used to implement POST /screenshot. Must be called
+   once during startup, before api_server_start(). Screenshots requested
+   before a handler is registered fail with "unsupported". */
+void api_server_set_screenshot_handler(api_screenshot_fn fn);
+
 #endif /* _API_SERVER_H_ */
