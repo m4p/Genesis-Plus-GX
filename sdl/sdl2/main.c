@@ -704,6 +704,15 @@ int sdl_input_update(void)
       break;
     }
   }
+
+  /* overlay any buttons held via POST /input on top of player 1's keyboard
+     state, so injected presses persist regardless of which device/joynum
+     the keyboard switch above is currently driving */
+  if (api_enabled)
+  {
+    input.pad[0] |= api_server_get_input_overlay();
+  }
+
   return 1;
 }
 
@@ -917,6 +926,13 @@ int main (int argc, char **argv)
     {
       fprintf(stderr, "Warning: failed to start JSON API server on %s:%d\n", api_bind, api_port);
       api_enabled = 0;
+    }
+    else
+    {
+      /* force the full 6-button pad for player 1 so POST /input can reach
+         every button (X/Y/Z/Mode are otherwise unreachable on a 3-button
+         pad, regardless of what bits are set in input.pad[]) */
+      input.dev[0] = DEVICE_PAD6B;
     }
   }
 

@@ -112,6 +112,22 @@ server.registerTool(
     toolResult(await apiPost("/search", { domain, pattern, encoding, start, end, max_results }))
 );
 
+const BUTTON_NAMES = ["up", "down", "left", "right", "a", "b", "c", "x", "y", "z", "start", "mode"];
+
+server.registerTool(
+  "press_buttons",
+  {
+    title: "Press/release gamepad buttons",
+    description:
+      "Hold and/or release buttons on player 1's gamepad. Supports the full Mega Drive / Mega CD 6-button pad: up, down, left, right, a, b, c, x, y, z, start, mode. Buttons stay held across frames until released; call again with 'release' to let go, or pair with frame_step while paused for precise single-frame input.",
+    inputSchema: {
+      press: z.array(z.enum(BUTTON_NAMES)).optional().describe("Buttons to start holding"),
+      release: z.array(z.enum(BUTTON_NAMES)).optional().describe("Buttons to stop holding"),
+    },
+  },
+  async ({ press, release }) => toolResult(await apiPost("/input", { press, release }))
+);
+
 server.registerTool(
   "pause",
   {

@@ -33,4 +33,10 @@ int api_server_process_pending(void);
    memory peek/poke requests are still serviced. */
 int api_server_is_paused(void);
 
+/* Returns the bitmask (INPUT_* values from core/input_hw/input.h) of
+   buttons currently held via POST /input. Must be called from the
+   main/emulation thread; intended to be OR'd into input.pad[0] once per
+   frame so injected button presses persist alongside real keyboard input. */
+uint16 api_server_get_input_overlay(void);
+
 #endif /* _API_SERVER_H_ */

@@ -55,6 +55,7 @@ typedef enum
   API_REQ_PEEK,
   API_REQ_POKE,
   API_REQ_SEARCH,
+  API_REQ_INPUT,
   API_REQ_PAUSE,
   API_REQ_RESUME,
   API_REQ_FRAME,
@@ -72,6 +73,9 @@ typedef struct
   uint8 buffer[MEMORY_API_MAX_TRANSFER]; /* poke input, peek output, or search pattern */
   uint32 search_offsets[MEMORY_API_MAX_SEARCH_RESULTS]; /* search only */
   uint32 search_count;       /* search only */
+  uint16 input_press_mask;   /* input only: buttons to start holding */
+  uint16 input_release_mask; /* input only: buttons to stop holding */
+  uint16 input_held_mask;    /* input only: resulting held-button state */
   int result; /* MEMORY_API_OK / MEMORY_API_ERR_* on completion */
 } api_mailbox_t;
 
@@ -83,6 +87,13 @@ static SDL_cond  *mailbox_cond  = NULL;
 
 static volatile int server_running = 0;
 static volatile int api_paused     = 0;
+
+/* Buttons currently held via POST /input. Only ever mutated from the
+   main/emulation thread (inside api_server_process_pending(), itself only
+   reachable via the mailbox), and only ever read from the main/emulation
+   thread (sdl2/main.c's sdl_input_update(), called once per frame from the
+   same loop that calls api_server_process_pending()) -- no locking needed. */
+static uint16 api_held_buttons = 0;
 static int listen_fd = -1;
 static SDL_Thread *server_thread = NULL;
 
@@ -149,6 +160,12 @@ int api_server_process_pending(void)
                                           &mailbox.search_count);
       break;
 
+    case API_REQ_INPUT:
+      api_held_buttons = (api_held_buttons | mailbox.input_press_mask) & (uint16)~mailbox.input_release_mask;
+      mailbox.input_held_mask = api_held_buttons;
+      mailbox.result = MEMORY_API_OK;
+      break;
+
     case API_REQ_PAUSE:
       api_paused = 1;
       mailbox.result = MEMORY_API_OK;
@@ -196,6 +213,11 @@ int api_server_process_pending(void)
 int api_server_is_paused(void)
 {
   return api_paused;
+}
+
+uint16 api_server_get_input_overlay(void)
+{
+  return api_held_buttons;
 }
 
 /* ------------------------------------------------------------------------ */
@@ -266,6 +288,56 @@ static int json_get_uint(const char *json, const char *key, uint32 *out)
 
   *out = (uint32)val;
   return 1;
+}
+
+#define JSON_ARRAY_NAME_CAP 32
+
+/* Parses a JSON array of strings for 'key' (e.g. ["a","start"]), writing up
+   to 'max_names' NUL-terminated entries (each truncated to
+   JSON_ARRAY_NAME_CAP-1 chars) into out_names. Returns the number of names
+   parsed, 0 if 'key' is absent (treated as an empty list), or -1 if 'key'
+   is present but is not a well-formed array of strings. */
+static int json_get_string_array(const char *json, const char *key,
+                                  char out_names[][JSON_ARRAY_NAME_CAP], int max_names)
+{
+  const char *v = json_find_key(json, key);
+  int count = 0;
+
+  if (!v) return 0;
+
+  while ((*v == ' ') || (*v == '\t')) v++;
+  if (*v != '[') return -1;
+  v++;
+
+  while ((*v == ' ') || (*v == '\t') || (*v == '\n') || (*v == '\r')) v++;
+  if (*v == ']') return 0;
+
+  for (;;)
+  {
+    size_t i = 0;
+
+    while ((*v == ' ') || (*v == '\t')) v++;
+    if (*v != '"') return -1;
+    v++;
+
+    if (count >= max_names) return -1;
+
+    while (*v && (*v != '"') && (i + 1 < JSON_ARRAY_NAME_CAP))
+    {
+      out_names[count][i++] = *v++;
+    }
+    if (*v != '"') return -1;
+    v++;
+    out_names[count][i] = '\0';
+    count++;
+
+    while ((*v == ' ') || (*v == '\t')) v++;
+    if (*v == ',') { v++; continue; }
+    if (*v == ']') break;
+    return -1;
+  }
+
+  return count;
 }
 
 /* ------------------------------------------------------------------------ */
@@ -805,6 +877,111 @@ static void handle_search(int fd, const char *json)
   free(out_text);
 }
 
+/* Full Mega Drive / Mega CD 6-button pad layout. */
+typedef struct
+{
+  const char *name;
+  uint16 bit;
+} button_def_t;
+
+static const button_def_t button_table[] =
+{
+  { "up",    INPUT_UP },
+  { "down",  INPUT_DOWN },
+  { "left",  INPUT_LEFT },
+  { "right", INPUT_RIGHT },
+  { "a",     INPUT_A },
+  { "b",     INPUT_B },
+  { "c",     INPUT_C },
+  { "x",     INPUT_X },
+  { "y",     INPUT_Y },
+  { "z",     INPUT_Z },
+  { "start", INPUT_START },
+  { "mode",  INPUT_MODE }
+};
+
+#define BUTTON_TABLE_COUNT (sizeof(button_table) / sizeof(button_table[0]))
+
+static int button_name_to_bit(const char *name, uint16 *out_bit)
+{
+  size_t i;
+
+  for (i = 0; i < BUTTON_TABLE_COUNT; i++)
+  {
+    if (!strcmp(button_table[i].name, name))
+    {
+      *out_bit = button_table[i].bit;
+      return 1;
+    }
+  }
+
+  return 0;
+}
+
+static void handle_input(int fd, const char *json)
+{
+  char press_names[16][JSON_ARRAY_NAME_CAP];
+  char release_names[16][JSON_ARRAY_NAME_CAP];
+  int press_count, release_count, i;
+  uint16 press_mask = 0, release_mask = 0;
+  api_mailbox_t req;
+  char body[512];
+  size_t off;
+  int first;
+
+  press_count = json_get_string_array(json, "press", press_names, 16);
+  release_count = json_get_string_array(json, "release", release_names, 16);
+
+  if ((press_count < 0) || (release_count < 0))
+  {
+    send_error(fd, 400, "bad_json", "'press' and 'release' must be arrays of button name strings");
+    return;
+  }
+
+  for (i = 0; i < press_count; i++)
+  {
+    uint16 bit;
+    if (!button_name_to_bit(press_names[i], &bit))
+    {
+      send_error(fd, 400, "unknown_button", "Unknown button name");
+      return;
+    }
+    press_mask |= bit;
+  }
+
+  for (i = 0; i < release_count; i++)
+  {
+    uint16 bit;
+    if (!button_name_to_bit(release_names[i], &bit))
+    {
+      send_error(fd, 400, "unknown_button", "Unknown button name");
+      return;
+    }
+    release_mask |= bit;
+  }
+
+  memset(&req, 0, sizeof(req));
+  req.type = API_REQ_INPUT;
+  req.input_press_mask = press_mask;
+  req.input_release_mask = release_mask;
+
+  submit_request(&req);
+
+  off = (size_t)snprintf(body, sizeof(body), "{\"ok\":true,\"held\":[");
+  first = 1;
+  for (i = 0; i < (int)BUTTON_TABLE_COUNT; i++)
+  {
+    if (req.input_held_mask & button_table[i].bit)
+    {
+      off += (size_t)snprintf(body + off, sizeof(body) - off, "%s\"%s\"", first ? "" : ",", button_table[i].name);
+      first = 0;
+    }
+  }
+  snprintf(body + off, sizeof(body) - off, "]}");
+
+  send_ok(fd, body);
+}
+
 static void handle_simple_control(int fd, api_request_type_t type)
 {
   api_mailbox_t req;
@@ -948,6 +1125,10 @@ static void handle_connection(int fd)
   else if (!strcmp(method, "POST") && !strcmp(path, "/search"))
   {
     handle_search(fd, body);
+  }
+  else if (!strcmp(method, "POST") && !strcmp(path, "/input"))
+  {
+    handle_input(fd, body);
   }
   else if (!strcmp(method, "POST") && !strcmp(path, "/poke"))
   {
