@@ -159,6 +159,20 @@ server.registerTool(
 );
 
 server.registerTool(
+  "registers",
+  {
+    title: "Read/write CPU registers",
+    description:
+      "Read the registers of a CPU (m68k = main 68000, s68k = Mega CD SubCPU, z80 = sound CPU), optionally writing one or more registers first. For m68k/s68k: d0-d7, a0-a7, pc (writable), plus sr/usp/ssp/halted (read-only). For z80: pc, sp, af, bc, de, hl, ix, iy (writable), plus af2/bc2/de2/hl2/halted (read-only).",
+    inputSchema: {
+      cpu: z.enum(["m68k", "s68k", "z80"]),
+      set: z.record(z.string(), z.number().int()).optional().describe("Register name -> new value, e.g. {\"pc\": 4096, \"d0\": 0}"),
+    },
+  },
+  async ({ cpu, set }) => toolResult(await apiPost("/registers", { cpu, ...set }))
+);
+
+server.registerTool(
   "screenshot",
   {
     title: "Take a screenshot",

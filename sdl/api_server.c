@@ -60,6 +60,7 @@ typedef enum
   API_REQ_SCREENSHOT,
   API_REQ_STATE_SAVE,
   API_REQ_STATE_LOAD,
+  API_REQ_REGISTERS,
   API_REQ_PAUSE,
   API_REQ_RESUME,
   API_REQ_FRAME,
@@ -83,6 +84,11 @@ typedef struct
   char path[512];            /* screenshot / state save / state load */
   int width, height;         /* screenshot only */
   uint32 state_bytes;        /* state save only */
+  char reg_cpu[8];                 /* registers only: "m68k" / "s68k" / "z80" */
+  char reg_set_names[20][8];       /* registers only: register names to write before reading back */
+  uint32 reg_set_values[20];       /* registers only */
+  int reg_set_count;               /* registers only */
+  char reg_json[768];              /* registers only: full register-state response body, filled by process_pending */
   int result; /* MEMORY_API_OK / MEMORY_API_ERR_* on completion for memory
                  requests; 0 on success / -1 on failure for everything else */
 } api_mailbox_t;
@@ -222,6 +228,89 @@ int api_server_process_pending(void)
       n = fread(state_scratch, 1, STATE_SIZE, f);
       fclose(f);
       mailbox.result = ((n > 0) && state_load(state_scratch)) ? 0 : -1;
+      break;
+    }
+
+    case API_REQ_REGISTERS:
+    {
+      int i;
+      size_t off;
+
+      if (!strcmp(mailbox.reg_cpu, "z80"))
+      {
+        for (i = 0; i < mailbox.reg_set_count; i++)
+        {
+          const char *name = mailbox.reg_set_names[i];
+          uint32 value = mailbox.reg_set_values[i] & 0xFFFF;
+
+          if (!strcmp(name, "pc")) Z80.pc.d = value;
+          else if (!strcmp(name, "sp")) Z80.sp.d = value;
+          else if (!strcmp(name, "af")) Z80.af.d = value;
+          else if (!strcmp(name, "bc")) Z80.bc.d = value;
+          else if (!strcmp(name, "de")) Z80.de.d = value;
+          else if (!strcmp(name, "hl")) Z80.hl.d = value;
+          else if (!strcmp(name, "ix")) Z80.ix.d = value;
+          else if (!strcmp(name, "iy")) Z80.iy.d = value;
+        }
+
+        snprintf(mailbox.reg_json, sizeof(mailbox.reg_json),
+                 "{\"cpu\":\"z80\",\"pc\":%u,\"sp\":%u,\"af\":%u,\"bc\":%u,\"de\":%u,\"hl\":%u,\"ix\":%u,\"iy\":%u,"
+                 "\"af2\":%u,\"bc2\":%u,\"de2\":%u,\"hl2\":%u,\"halted\":%s}",
+                 Z80.pc.d & 0xFFFF, Z80.sp.d & 0xFFFF, Z80.af.d & 0xFFFF, Z80.bc.d & 0xFFFF,
+                 Z80.de.d & 0xFFFF, Z80.hl.d & 0xFFFF, Z80.ix.d & 0xFFFF, Z80.iy.d & 0xFFFF,
+                 Z80.af2.d & 0xFFFF, Z80.bc2.d & 0xFFFF, Z80.de2.d & 0xFFFF, Z80.hl2.d & 0xFFFF,
+                 Z80.halt ? "true" : "false");
+      }
+      else
+      {
+        m68ki_cpu_core *cpu = !strcmp(mailbox.reg_cpu, "s68k") ? &s68k : &m68k;
+        static const char *dnames[8] = { "d0", "d1", "d2", "d3", "d4", "d5", "d6", "d7" };
+        static const char *anames[8] = { "a0", "a1", "a2", "a3", "a4", "a5", "a6", "a7" };
+        uint32 ccr, sr, usp, ssp;
+        int j;
+
+        for (i = 0; i < mailbox.reg_set_count; i++)
+        {
+          const char *name = mailbox.reg_set_names[i];
+          uint32 value = mailbox.reg_set_values[i];
+          int matched = 0;
+
+          for (j = 0; j < 8; j++)
+          {
+            if (!strcmp(name, dnames[j])) { cpu->dar[j] = value; matched = 1; break; }
+            if (!strcmp(name, anames[j])) { cpu->dar[8 + j] = value; matched = 1; break; }
+          }
+          if (!matched && !strcmp(name, "pc"))
+          {
+            cpu->pc = value;
+          }
+        }
+
+        ccr = ((cpu->x_flag & 0x100) >> 4)
+            | ((cpu->n_flag & 0x80) >> 4)
+            | (cpu->not_z_flag ? 0 : 4)
+            | ((cpu->v_flag & 0x80) >> 6)
+            | ((cpu->c_flag & 0x100) >> 8);
+        sr = cpu->t1_flag | (cpu->s_flag << 11) | cpu->int_mask | ccr;
+        usp = cpu->s_flag ? cpu->sp[0] : cpu->dar[15];
+        ssp = cpu->s_flag ? cpu->dar[15] : cpu->sp[4];
+
+        off = (size_t)snprintf(mailbox.reg_json, sizeof(mailbox.reg_json),
+                                "{\"cpu\":\"%s\",\"pc\":%u,\"sr\":%u,\"usp\":%u,\"ssp\":%u,\"halted\":%s,\"d\":[",
+                                mailbox.reg_cpu, cpu->pc, sr, usp, ssp, cpu->stopped ? "true" : "false");
+        for (i = 0; i < 8; i++)
+        {
+          off += (size_t)snprintf(mailbox.reg_json + off, sizeof(mailbox.reg_json) - off, "%s%u", i ? "," : "", cpu->dar[i]);
+        }
+        off += (size_t)snprintf(mailbox.reg_json + off, sizeof(mailbox.reg_json) - off, "],\"a\":[");
+        for (i = 0; i < 8; i++)
+        {
+          off += (size_t)snprintf(mailbox.reg_json + off, sizeof(mailbox.reg_json) - off, "%s%u", i ? "," : "", cpu->dar[8 + i]);
+        }
+        snprintf(mailbox.reg_json + off, sizeof(mailbox.reg_json) - off, "]}");
+      }
+
+      mailbox.result = 0;
       break;
     }
 
@@ -1041,6 +1130,63 @@ static void handle_input(int fd, const char *json)
   send_ok(fd, body);
 }
 
+/* Register names that POST /registers will accept as 'set' fields, per CPU.
+   A field is treated as a write request if json_get_uint() finds it
+   anywhere in the request body -- this minimal parser doesn't distinguish
+   nesting, so {"cpu":"m68k","d0":1} and {"cpu":"m68k","set":{"d0":1}} are
+   equivalent; the latter is just clearer to read in client code. */
+static const char *m68k_settable_names[] = { "d0","d1","d2","d3","d4","d5","d6","d7",
+                                              "a0","a1","a2","a3","a4","a5","a6","a7","pc" };
+static const char *z80_settable_names[] = { "pc","sp","af","bc","de","hl","ix","iy" };
+
+static void handle_registers(int fd, const char *json)
+{
+  char cpu_name[8];
+  api_mailbox_t req;
+  const char **names;
+  size_t name_count, i;
+
+  if (!json_get_string(json, "cpu", cpu_name, sizeof(cpu_name)))
+  {
+    send_error(fd, 400, "bad_json", "Missing or invalid 'cpu' field");
+    return;
+  }
+  if (strcmp(cpu_name, "m68k") && strcmp(cpu_name, "s68k") && strcmp(cpu_name, "z80"))
+  {
+    send_error(fd, 400, "unknown_cpu", "Supported values for 'cpu' are 'm68k', 's68k' and 'z80'");
+    return;
+  }
+
+  memset(&req, 0, sizeof(req));
+  req.type = API_REQ_REGISTERS;
+  strncpy(req.reg_cpu, cpu_name, sizeof(req.reg_cpu) - 1);
+
+  if (!strcmp(cpu_name, "z80"))
+  {
+    names = z80_settable_names;
+    name_count = sizeof(z80_settable_names) / sizeof(z80_settable_names[0]);
+  }
+  else
+  {
+    names = m68k_settable_names;
+    name_count = sizeof(m68k_settable_names) / sizeof(m68k_settable_names[0]);
+  }
+
+  for (i = 0; i < name_count; i++)
+  {
+    uint32 value;
+    if (json_get_uint(json, names[i], &value) && (req.reg_set_count < (int)(sizeof(req.reg_set_names) / sizeof(req.reg_set_names[0]))))
+    {
+      strncpy(req.reg_set_names[req.reg_set_count], names[i], sizeof(req.reg_set_names[0]) - 1);
+      req.reg_set_values[req.reg_set_count] = value;
+      req.reg_set_count++;
+    }
+  }
+
+  submit_request(&req);
+  send_ok(fd, req.reg_json);
+}
+
 static void handle_screenshot(int fd, const char *json)
 {
   char folder[400];
@@ -1277,6 +1423,10 @@ static void handle_connection(int fd)
   else if (!strcmp(method, "POST") && !strcmp(path, "/input"))
   {
     handle_input(fd, body);
+  }
+  else if (!strcmp(method, "POST") && !strcmp(path, "/registers"))
+  {
+    handle_registers(fd, body);
   }
   else if (!strcmp(method, "POST") && !strcmp(path, "/screenshot"))
   {
