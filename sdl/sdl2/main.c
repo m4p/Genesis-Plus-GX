@@ -4,12 +4,16 @@
 #include "shared.h"
 #include "sms_ntsc.h"
 #include "md_ntsc.h"
+#include "api_server.h"
 
 #define SOUND_FREQUENCY 48000
 #define SOUND_SAMPLES_SIZE  2048
 
 #define VIDEO_WIDTH  320
 #define VIDEO_HEIGHT 240
+
+#define API_DEFAULT_BIND "127.0.0.1"
+#define API_DEFAULT_PORT  8765
 
 int joynum = 0;
 
@@ -18,6 +22,10 @@ int debug_on    = 0;
 int turbo_mode  = 0;
 int use_sound   = 1;
 int fullscreen  = 0; /* SDL_WINDOW_FULLSCREEN */
+
+static int api_enabled  = 0;
+static int api_port     = API_DEFAULT_PORT;
+static char api_bind[64] = API_DEFAULT_BIND;
 
 struct {
   SDL_Window* window;
@@ -669,15 +677,15 @@ int sdl_input_update(void)
 
     case DEVICE_SMASH:
     {
-      if(keystate[SDLK_KP9])  input.pad[joynum] |= INPUT_SMASH_UP_RIGHT;
-      if(keystate[SDLK_KP8])  input.pad[joynum] |= INPUT_SMASH_UP;
-      if(keystate[SDLK_KP7])  input.pad[joynum] |= INPUT_SMASH_UP_LEFT;
-      if(keystate[SDLK_KP6])  input.pad[joynum] |= INPUT_SMASH_RIGHT;
-      if(keystate[SDLK_KP5])  input.pad[joynum] |= INPUT_SMASH_CENTER;
-      if(keystate[SDLK_KP4])  input.pad[joynum] |= INPUT_SMASH_LEFT;
-      if(keystate[SDLK_KP3])  input.pad[joynum] |= INPUT_SMASH_DOWN_RIGHT;
-      if(keystate[SDLK_KP2])  input.pad[joynum] |= INPUT_SMASH_DOWN;
-      if(keystate[SDLK_KP1])  input.pad[joynum] |= INPUT_SMASH_DOWN_LEFT;
+      if(keystate[SDLK_KP_9])  input.pad[joynum] |= INPUT_SMASH_UP_RIGHT;
+      if(keystate[SDLK_KP_8])  input.pad[joynum] |= INPUT_SMASH_UP;
+      if(keystate[SDLK_KP_7])  input.pad[joynum] |= INPUT_SMASH_UP_LEFT;
+      if(keystate[SDLK_KP_6])  input.pad[joynum] |= INPUT_SMASH_RIGHT;
+      if(keystate[SDLK_KP_5])  input.pad[joynum] |= INPUT_SMASH_CENTER;
+      if(keystate[SDLK_KP_4])  input.pad[joynum] |= INPUT_SMASH_LEFT;
+      if(keystate[SDLK_KP_3])  input.pad[joynum] |= INPUT_SMASH_DOWN_RIGHT;
+      if(keystate[SDLK_KP_2])  input.pad[joynum] |= INPUT_SMASH_DOWN;
+      if(keystate[SDLK_KP_1])  input.pad[joynum] |= INPUT_SMASH_DOWN_LEFT;
       break;
     }
 
@@ -718,14 +726,62 @@ int main (int argc, char **argv)
 {
   FILE *fp;
   int running = 1;
+  int i;
+  char *rom_path = NULL;
+
+  /* parse command line flags */
+  for (i = 1; i < argc; i++)
+  {
+    if (!strcmp(argv[i], "--api-port") && (i + 1 < argc))
+    {
+      api_enabled = 1;
+      api_port = atoi(argv[++i]);
+    }
+    else if (!strcmp(argv[i], "--api-bind") && (i + 1 < argc))
+    {
+      api_enabled = 1;
+      strncpy(api_bind, argv[++i], sizeof(api_bind) - 1);
+      api_bind[sizeof(api_bind) - 1] = '\0';
+    }
+    else if (!strcmp(argv[i], "--api") && (i + 1 < argc))
+    {
+      char *spec = argv[++i];
+      char *colon = strrchr(spec, ':');
+      api_enabled = 1;
+      if (colon)
+      {
+        size_t hostlen = (size_t)(colon - spec);
+        if (hostlen >= sizeof(api_bind)) hostlen = sizeof(api_bind) - 1;
+        memcpy(api_bind, spec, hostlen);
+        api_bind[hostlen] = '\0';
+        api_port = atoi(colon + 1);
+      }
+      else
+      {
+        api_port = atoi(spec);
+      }
+    }
+    else if (!rom_path)
+    {
+      rom_path = argv[i];
+    }
+  }
 
   /* Print help if no game specified */
-  if(argc < 2)
+  if(!rom_path)
   {
-    char caption[256];
-    sprintf(caption, "Genesis Plus GX\\SDL\nusage: %s gamename\n", argv[0]);
+    char caption[512];
+    sprintf(caption, "Genesis Plus GX\\SDL\nusage: %s [--api-port <port>] [--api-bind <address>] gamename\n\n"
+                      "  --api-port <port>        Enable local JSON peek/poke API on 127.0.0.1\n"
+                      "  --api-bind <address>     Bind API server to address, default 127.0.0.1\n",
+                      argv[0]);
     SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_INFORMATION, "Information", caption, sdl_video.window);
     return 1;
+  }
+
+  if (api_enabled && strcmp(api_bind, "127.0.0.1") && strcmp(api_bind, "localhost"))
+  {
+    fprintf(stderr, "Warning: --api-bind '%s' is not localhost; the JSON memory API will be reachable from the network\n", api_bind);
   }
 
   /* set default config */
@@ -791,10 +847,10 @@ int main (int argc, char **argv)
   bitmap.viewport.changed = 3;
 
   /* Load game file */
-  if(!load_rom(argv[1]))
+  if(!load_rom(rom_path))
   {
     char caption[256];
-    sprintf(caption, "Error loading file `%s'.", argv[1]);
+    sprintf(caption, "Error loading file `%s'.", rom_path);
     SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "Error", caption, sdl_video.window);
     return 1;
   }
@@ -868,6 +924,16 @@ int main (int argc, char **argv)
   /* reset system hardware */
   system_reset();
 
+  /* start local JSON peek/poke API, if requested */
+  if (api_enabled)
+  {
+    if (api_server_start(api_bind, api_port) != 0)
+    {
+      fprintf(stderr, "Warning: failed to start JSON API server on %s:%d\n", api_bind, api_port);
+      api_enabled = 0;
+    }
+  }
+
   if(use_sound) SDL_PauseAudio(0);
 
   /* 3 frames = 50 ms (60hz) or 60 ms (50hz) */
@@ -904,13 +970,26 @@ int main (int argc, char **argv)
       }
     }
 
-    sdl_video_update();
-    sdl_sound_update(use_sound);
+    if (api_enabled)
+    {
+      api_server_process_pending();
+    }
+
+    if (!api_enabled || !api_server_is_paused())
+    {
+      sdl_video_update();
+      sdl_sound_update(use_sound);
+    }
 
     if(!turbo_mode && sdl_sync.sem_sync && sdl_video.frames_rendered % 3 == 0)
     {
       SDL_SemWait(sdl_sync.sem_sync);
     }
+  }
+
+  if (api_enabled)
+  {
+    api_server_stop();
   }
 
   if (system_hw == SYSTEM_MCD)

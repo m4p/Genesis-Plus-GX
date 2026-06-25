@@ -127,7 +127,10 @@ OBJECTS	+=	$(OBJDIR)/main.o	\
 		$(OBJDIR)/config.o	\
 		$(OBJDIR)/error.o	\
 		$(OBJDIR)/unzip.o       \
-		$(OBJDIR)/fileio.o	
+		$(OBJDIR)/fileio.o	\
+		$(OBJDIR)/api_server.o
+
+OBJECTS	+=	$(OBJDIR)/memory_api.o
 
 OBJECTS	+=	$(OBJDIR)/bitwise.o	 \
 		$(OBJDIR)/block.o      \
