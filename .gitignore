@@ -16,3 +16,9 @@ sdl/build_sdl2
 
 *.o
 *.a
+.DS_Store
+/sdl/bios_CD_U.bin
+/sdl/cart.brm
+/sdl/PTSM1.bin
+/sdl/PTSM1.cue
+/sdl/scd.brm
