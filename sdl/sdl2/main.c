@@ -262,53 +262,39 @@ static void sdl_video_close()
   SDL_DestroyWindow(sdl_video.window);
 }
 
-/* Timer Sync */
+/* Frame Sync
+ *
+ * Pacing is done with SDL_GetPerformanceCounter() directly in the main
+ * thread, frame by frame, instead of a background SDL_AddTimer thread
+ * waking the main thread via a semaphore every 3 frames. The timer-thread
+ * approach is prone to scheduling jitter (e.g. timer coalescing/App Nap on
+ * macOS); when it fires late, the emulation loop stalls and the audio ring
+ * buffer underruns, which is heard as an irregular dropout even though CPU
+ * usage stays low (the thread is blocked, not busy).
+ */
 
 struct {
-  SDL_sem* sem_sync;
-  unsigned ticks;
+  Uint64 freq;
+  Uint64 next_frame;
+  Uint64 fps_last;
 } sdl_sync;
-
-static Uint32 sdl_sync_timer_callback(Uint32 interval, void *param)
-{
-  SDL_SemPost(sdl_sync.sem_sync);
-  sdl_sync.ticks++;
-  if (sdl_sync.ticks == (vdp_pal ? 50 : 20))
-  {
-    SDL_Event event;
-    SDL_UserEvent userevent;
-
-    userevent.type = SDL_USEREVENT;
-    userevent.code = vdp_pal ? (sdl_video.frames_rendered / 3) : sdl_video.frames_rendered;
-    userevent.data1 = NULL;
-    userevent.data2 = NULL;
-    sdl_sync.ticks = sdl_video.frames_rendered = 0;
-
-    event.type = SDL_USEREVENT;
-    event.user = userevent;
-
-    SDL_PushEvent(&event);
-  }
-  return interval;
-}
 
 static int sdl_sync_init()
 {
-  if(SDL_InitSubSystem(SDL_INIT_TIMER|SDL_INIT_EVENTS) < 0)
+  if(SDL_InitSubSystem(SDL_INIT_EVENTS) < 0)
   {
-    SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "Error", "SDL Timer initialization failed", sdl_video.window);
+    SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "Error", "SDL Events initialization failed", sdl_video.window);
     return 0;
   }
 
-  sdl_sync.sem_sync = SDL_CreateSemaphore(0);
-  sdl_sync.ticks = 0;
+  sdl_sync.freq = SDL_GetPerformanceFrequency();
+  sdl_sync.next_frame = SDL_GetPerformanceCounter();
+  sdl_sync.fps_last = sdl_sync.next_frame;
   return 1;
 }
 
 static void sdl_sync_close()
 {
-  if(sdl_sync.sem_sync)
-    SDL_DestroySemaphore(sdl_sync.sem_sync);
 }
 
 static const uint16 vc_table[4][2] =
@@ -370,7 +356,7 @@ static int sdl_control_update(SDL_Keycode keystate)
         if (!use_sound)
         {
           turbo_mode ^=1;
-          sdl_sync.ticks = 0;
+          sdl_sync.next_frame = SDL_GetPerformanceCounter();
         }
         break;
       }
@@ -936,9 +922,8 @@ int main (int argc, char **argv)
 
   if(use_sound) SDL_PauseAudio(0);
 
-  /* 3 frames = 50 ms (60hz) or 60 ms (50hz) */
-  if(sdl_sync.sem_sync)
-    SDL_AddTimer(vdp_pal ? 60 : 50, sdl_sync_timer_callback, NULL);
+  sdl_sync.next_frame = SDL_GetPerformanceCounter();
+  sdl_sync.fps_last = sdl_sync.next_frame;
 
   /* emulation loop */
   while(running)
@@ -948,14 +933,6 @@ int main (int argc, char **argv)
     {
       switch(event.type)
       {
-        case SDL_USEREVENT:
-        {
-          char caption[100];
-          sprintf(caption,"Genesis Plus GX - %d fps - %s", event.user.code, (rominfo.international[0] != 0x20) ? rominfo.international : rominfo.domestic);
-          SDL_SetWindowTitle(sdl_video.window, caption);
-          break;
-        }
-
         case SDL_QUIT:
         {
           running = 0;
@@ -981,9 +958,35 @@ int main (int argc, char **argv)
       sdl_sound_update(use_sound);
     }
 
-    if(!turbo_mode && sdl_sync.sem_sync && sdl_video.frames_rendered % 3 == 0)
+    if (sdl_video.frames_rendered &&
+        SDL_GetPerformanceCounter() - sdl_sync.fps_last >= sdl_sync.freq)
     {
-      SDL_SemWait(sdl_sync.sem_sync);
+      char caption[100];
+      Uint64 elapsed = SDL_GetPerformanceCounter() - sdl_sync.fps_last;
+      int fps = (int)((Uint64)sdl_video.frames_rendered * sdl_sync.freq / elapsed);
+      sprintf(caption,"Genesis Plus GX - %d fps - %s", fps, (rominfo.international[0] != 0x20) ? rominfo.international : rominfo.domestic);
+      SDL_SetWindowTitle(sdl_video.window, caption);
+      sdl_sync.fps_last = SDL_GetPerformanceCounter();
+      sdl_video.frames_rendered = 0;
+    }
+
+    if(!turbo_mode)
+    {
+      Uint64 frame_ticks = sdl_sync.freq / (vdp_pal ? 50 : 60);
+      Uint64 now;
+
+      sdl_sync.next_frame += frame_ticks;
+      now = SDL_GetPerformanceCounter();
+      if (now < sdl_sync.next_frame)
+      {
+        Uint32 ms = (Uint32)(((sdl_sync.next_frame - now) * 1000) / sdl_sync.freq);
+        if (ms > 0) SDL_Delay(ms);
+      }
+      else
+      {
+        /* we fell behind real time; don't accumulate unbounded debt */
+        sdl_sync.next_frame = now;
+      }
     }
   }
 
